@@ -1,0 +1,18 @@
+[package]
+name = "troxy"
+version = "0.1.0"
+authors = ["Viktor Garske <info@v-gar.de>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rustls = "0.16.0"
+webpki = "0.21.0"
+webpki-roots = "0.17.0"
+http_parser = "0.0.2"
+mio = "0.6.19"
+tokio = "0.1.22"
+log = "0.4.8"
+env_logger = "0.7.0"
+clap = "2.33.0"
