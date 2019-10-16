@@ -29,11 +29,12 @@ openssl req -nodes -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 36
 Then run:
 
 ```bash
-cargo run
+cargo run -- -k /tmp/key.pem -c /tmp/cert.pem
 ```
 
 A proxy will be spawned on port 8080.
 
 [^1]: This is only needed during early development phase.
+
 [1]: https://www.rust-lang.org/
 [2]: https://rustup.rs/
