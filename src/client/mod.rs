@@ -13,15 +13,93 @@
 use std::sync::Arc;
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, SocketAddr, Shutdown};
 
 use rustls;
 use webpki;
 use webpki_roots;
 
-use rustls::Session;
+use rustls::{Session, ClientSession};
 
 use log::debug;
+
+pub struct ClientConnection {
+    socketaddr: SocketAddr,
+    socket: TcpStream,
+    tls_session: ClientSession,
+
+    closing: bool,
+    closed: bool,
+}
+
+impl ClientConnection {
+    pub fn new(socketaddr: &SocketAddr, hostname: &str) -> ClientConnection {
+        let mut config = rustls::ClientConfig::new();
+        config
+            .root_store
+            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+
+        let dns_name = webpki::DNSNameRef::try_from_ascii_str(hostname).unwrap();
+        let mut sess = rustls::ClientSession::new(&Arc::new(config), dns_name);
+        let mut sock = TcpStream::connect(socketaddr).unwrap();
+
+        ClientConnection {
+            socketaddr: *socketaddr,
+            socket: sock,
+            tls_session: sess,
+            closing: false,
+            closed: false
+        }
+    }
+
+    pub fn new_by_hostname(ip: &str, port: u16, hostname: &str) -> ClientConnection {
+        let socketaddr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
+        Self::new(&socketaddr, hostname)
+    }
+
+    pub fn get_stream(&mut self) -> rustls::Stream<ClientSession, TcpStream> {
+        rustls::Stream::new(&mut self.tls_session, &mut self.socket)
+    }
+
+    pub fn write(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
+        self.get_stream().write_all(buf)
+    }
+
+    pub fn receive_to_end(&mut self) -> Option<Vec<u8>> {
+        let mut tls = self.get_stream();
+        let mut plaintext = Vec::new();
+        let res = tls.read_to_end(&mut plaintext);
+
+        debug!("Finalized reading to end");
+        debug!("{:?}", res);
+
+        // if !plaintext.is_empty() {
+        // stdout().write_all(&plaintext).unwrap();
+        // }
+
+        let _terminated;
+        if res.is_err() {
+            let err = res.unwrap_err();
+            if err.kind() == ErrorKind::ConnectionAborted {
+                // println!("Connection terminated successfully");
+                _terminated = true;
+                return Some(plaintext);
+            } else {
+                println!("Error happened: {}", err);
+            }
+        }
+
+        None
+    }
+
+    pub fn close(&mut self) -> bool {
+        self.closing = true;
+        self.socket.shutdown(Shutdown::Both).unwrap();
+        self.closed = true;
+
+        true
+    }
+}
 
 pub fn get_page(domain: &str, path: &str) -> Option<Vec<u8>> {
     let httpreq = format!(
@@ -53,6 +131,9 @@ pub fn http_request(domain: &str, httpreq: &str) -> Option<Vec<u8>> {
     let mut plaintext = Vec::new();
     let res = tls.read_to_end(&mut plaintext);
 
+    debug!("Finalized reading to end");
+    debug!("{:?}", res);
+
     // if !plaintext.is_empty() {
     // stdout().write_all(&plaintext).unwrap();
     // }
@@ -65,7 +146,7 @@ pub fn http_request(domain: &str, httpreq: &str) -> Option<Vec<u8>> {
             _terminated = true;
             return Some(plaintext);
         } else {
-            println!("Error happend: {}", err);
+            println!("Error happened: {}", err);
         }
     }
 

@@ -31,10 +31,15 @@ use std::net::SocketAddr;
 use mio::net::TcpListener;
 use mio::Poll;
 
-use clap::{Arg, App};
+use clap::{Arg, App, SubCommand};
+use crate::server::ServerMode::{Plain, Http};
+use crate::server::Endpoint;
+
+use log::debug;
 
 pub mod client;
 pub mod server;
+pub mod connection;
 
 const LISTENER: mio::Token = mio::Token(0);
 
@@ -73,6 +78,29 @@ fn main() {
              .help("Sets the private key file")
              .takes_value(true)
              .required(true))
+        .subcommand(SubCommand::with_name("http")
+            .about("http proxy")
+            .version("0.1"))
+        .subcommand(SubCommand::with_name("plain")
+            .about("plain connection")
+            .arg(Arg::with_name("dsthost")
+                .long("dsthost")
+                .value_name("HOST")
+                .takes_value(true)
+                .required(true)
+                .help("IP of the destination host."))
+            .arg(Arg::with_name("dsthostname")
+                .long("dsthostname")
+                .value_name("HOSTNAME")
+                .takes_value(true)
+                .required(true)
+                .help("Name of the destination host. Must match the certificate name."))
+            .arg(Arg::with_name("dstport")
+                .long("dstport")
+                .value_name("PORT")
+                .takes_value(true)
+                .required(true)
+                .help("Destination port")))
         .get_matches();
 
 
@@ -86,6 +114,7 @@ fn main() {
     let listener = TcpListener::bind(&addr).expect("cannot bind on port");
 
     let mut poll = Poll::new().unwrap();
+
     poll.register(
         &listener,
         LISTENER,
@@ -96,7 +125,21 @@ fn main() {
 
     let config = server::make_config(cert_file, privkey_file);
 
-    let mut tlsserver = server::TlsServer::new(listener, config);
+    // Prepare the server mode
+    let mode: server::ServerMode;
+    if let Some(sub_matches) = matches.subcommand_matches("plain") {
+        let host = sub_matches.value_of("dsthost").unwrap();
+        let port = sub_matches.value_of("dstport").unwrap();
+        let hostname = sub_matches.value_of("dsthostname").unwrap();
+        let dst: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
+        mode = Plain(Endpoint{ socketaddr: dst, hostname: String::from(hostname) });
+    } else {
+        mode = Http;
+    }
+
+    debug!("Mode: {:?}", mode);
+
+    let mut tlsserver = server::TlsServer::new(mode, listener, config);
 
     let mut events = mio::Events::with_capacity(256);
 
@@ -104,6 +147,8 @@ fn main() {
         poll.poll(&mut events, None).unwrap();
 
         for event in events.iter() {
+            debug!("Master poll: processing event: {:?}", event);
+
             match event.token() {
                 LISTENER => {
                     if !tlsserver.accept(&mut poll) {
