@@ -11,9 +11,11 @@
 //! [1]: https://github.com/ctz/rustls/tree/master/rustls-mio
 
 use std::sync::Arc;
+use std::sync::mpsc::{channel, Sender, Receiver};
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, SocketAddr, Shutdown};
+use std::net::{SocketAddr, Shutdown};
+use mio::net::TcpStream;
 
 use rustls;
 use webpki;
@@ -21,19 +23,30 @@ use webpki_roots;
 
 use rustls::{Session, ClientSession};
 
-use log::debug;
+use log::{debug, error};
+
+use std::io;
 
 pub struct ClientConnection {
+    id: u32,
     socketaddr: SocketAddr,
     socket: TcpStream,
     tls_session: ClientSession,
 
     closing: bool,
     closed: bool,
+
+    tx: Option<Sender<Vec<u8>>>,
+    rx: Option<Receiver<Vec<u8>>>,
+
+    token: Option<mio::Token>,
 }
 
 impl ClientConnection {
-    pub fn new(socketaddr: &SocketAddr, hostname: &str) -> ClientConnection {
+    pub fn new(id: u32, socketaddr: &SocketAddr, hostname: &str,
+               tx: Option<Sender<Vec<u8>>>,
+               rx: Option<Receiver<Vec<u8>>>,
+               token: Option<mio::Token>) -> ClientConnection {
         let mut config = rustls::ClientConfig::new();
         config
             .root_store
@@ -43,53 +56,84 @@ impl ClientConnection {
         let mut sess = rustls::ClientSession::new(&Arc::new(config), dns_name);
         let mut sock = TcpStream::connect(socketaddr).unwrap();
 
+        debug!("Client session: {:?}", sess);
+        debug!("Client token: {:?}", token);
+
         ClientConnection {
+            id,
             socketaddr: *socketaddr,
             socket: sock,
             tls_session: sess,
             closing: false,
-            closed: false
+            closed: false,
+            tx,
+            rx,
+            token
         }
     }
 
-    pub fn new_by_hostname(ip: &str, port: u16, hostname: &str) -> ClientConnection {
+    pub fn new_by_hostname(id: u32, ip: &str, port: u16, hostname: &str) -> ClientConnection {
         let socketaddr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
-        Self::new(&socketaddr, hostname)
+        Self::new(id, &socketaddr, hostname, None, None, None)
     }
 
-    pub fn get_stream(&mut self) -> rustls::Stream<ClientSession, TcpStream> {
-        rustls::Stream::new(&mut self.tls_session, &mut self.socket)
+    fn do_read(&mut self) {
+        // Read TLS data.  This fails if the underlying TCP connection
+        // is broken.
+        let rc = self.tls_session.read_tls(&mut self.socket);
+        debug!("READ TLS: {:?}", rc);
+        if rc.is_err() {
+            let error = rc.unwrap_err();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return;
+            }
+            println!("TLS read error: {:?}", error);
+            self.close();
+            return;
+        }
+
+        // If we're ready but there's no data: EOF.
+        if rc.unwrap() == 0 {
+            println!("EOF");
+            self.close();
+            return;
+        }
+
+        // Reading some TLS data might have yielded new TLS
+        // messages to process.  Errors from this indicate
+        // TLS protocol problems and are fatal.
+        let processed = self.tls_session.process_new_packets();
+
+        debug!("Proccess result: {:?}", processed);
+
+        if processed.is_err() {
+            println!("TLS error: {:?}", processed.unwrap_err());
+            self.close();
+            return;
+        }
     }
 
-    pub fn write(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
-        self.get_stream().write_all(buf)
-    }
+    fn try_plain_read(&mut self) {
+        debug!("try_plain_read: try reading from plain");
+        let mut buffer = Vec::new();
 
-    pub fn receive_to_end(&mut self) -> Option<Vec<u8>> {
-        let mut tls = self.get_stream();
-        let mut plaintext = Vec::new();
-        let res = tls.read_to_end(&mut plaintext);
+        debug!("try_plain_read: self.tls_session: {:?}", self.tls_session);
+        let read = self.tls_session.read_to_end(&mut buffer);
 
-        debug!("Finalized reading to end");
-        debug!("{:?}", res);
+        debug!("Finished reading from plain: {:?}", read);
 
-        // if !plaintext.is_empty() {
-        // stdout().write_all(&plaintext).unwrap();
-        // }
+        if read.is_err() {
+            debug!("Plaintext read failed: {:?}, closing connection", read);
+            self.closing = true;
+            return;
+        }
 
-        let _terminated;
-        if res.is_err() {
-            let err = res.unwrap_err();
-            if err.kind() == ErrorKind::ConnectionAborted {
-                // println!("Connection terminated successfully");
-                _terminated = true;
-                return Some(plaintext);
-            } else {
-                println!("Error happened: {}", err);
+        if !buffer.is_empty() {
+            debug!("Plaintext read: {:?}", buffer.len());
+            if let Some(tx) = self.tx.as_mut() {
+                tx.send(buffer.to_vec());
             }
         }
-
-        None
     }
 
     pub fn close(&mut self) -> bool {
@@ -98,6 +142,107 @@ impl ClientConnection {
         self.closed = true;
 
         true
+    }
+
+    /// Register the Proxy to Server connection
+    pub fn register(&self, poll: &mut mio::Poll, client_token: mio::Token) {
+        debug!("Registering proxy -> server socket {:?} with token {:?} and event set {:?}", self.socket, client_token, self.event_set());
+        poll.register(
+            &self.socket,
+            client_token,
+            self.event_set(),
+            mio::PollOpt::level() | mio::PollOpt::oneshot(),
+        )
+            .unwrap();
+    }
+
+    pub fn reregister(&self, poll: &mut mio::Poll, client_token: mio::Token) {
+        debug!("REregistering proxy -> server socket {:?} with token {:?} and event set {:?}", self.socket, client_token, self.event_set());
+        poll.reregister(
+            &self.socket,
+            client_token,
+            self.event_set(),
+            mio::PollOpt::level() | mio::PollOpt::oneshot(),
+        )
+            .unwrap();
+    }
+
+    fn event_set(&self) -> mio::Ready {
+        let read = self.tls_session.wants_read();
+        let write = self.tls_session.wants_write();
+
+        if read && write {
+            mio::Ready::readable() | mio::Ready::writable()
+        } else if write {
+            mio::Ready::writable()
+        } else {
+            mio::Ready::readable()
+        }
+    }
+
+    pub fn ready(&mut self, poll: &mut mio::Poll, ev: &mio::Event) {
+        debug!("Ready called with poll {:?} and event {:?}", poll, ev);
+        if ev.readiness().is_readable() {
+            debug!("Readable client connection!");
+            // read from socket
+            // self.do_tls_read();
+            // self.try_plain_read();
+            // self.receive_to_end();
+            self.do_read();
+            self.try_plain_read();
+        }
+
+        if ev.readiness().is_writable() {
+            // write to socket
+            debug!("Writable client connection!");
+            self.fetch_new_data();
+            self.do_tls_write();
+        }
+
+        if !self.closed {
+            if let Some(token) = self.token {
+                self.reregister(poll, token);
+            }
+        }
+    }
+
+    fn fetch_new_data(&mut self) {
+        if let Some(rx) = self.rx.as_ref() {
+            debug!("rx available, waiting for data");
+            let msg = rx.try_recv();
+            if msg.is_err() {
+                debug!("No new rx info available");
+                return;
+            }
+            let msg = msg.unwrap();
+            debug!("MPSC data received: {:?}", msg);
+            debug!("MPSC data decoded: {}", String::from_utf8(msg.clone()).unwrap());
+            let res = self.write_all(&msg).unwrap();
+            debug!("Result: {:?}", res);
+        } else {
+            debug!("No rx available");
+        }
+    }
+
+    fn do_tls_write(&mut self) {
+        self.tls_session.write_tls(&mut self.socket);
+    }
+}
+
+impl io::Write for ClientConnection {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        debug!("Writing bytes to TLS session");
+        self.tls_session.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tls_session.flush()
+    }
+}
+
+impl io::Read for ClientConnection {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.tls_session.read(bytes)
     }
 }
 
@@ -120,7 +265,8 @@ pub fn http_request(domain: &str, httpreq: &str) -> Option<Vec<u8>> {
 
     let dns_name = webpki::DNSNameRef::try_from_ascii_str(domain).unwrap();
     let mut sess = rustls::ClientSession::new(&Arc::new(config), dns_name);
-    let mut sock = TcpStream::connect(format!("{}:443", domain)).unwrap();
+    let addr: SocketAddr = format!("{}:443", domain).parse().unwrap();
+    let mut sock = TcpStream::connect(&addr).unwrap();
     let mut tls = rustls::Stream::new(&mut sess, &mut sock);
 
     // Prepare the request
