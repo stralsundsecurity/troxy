@@ -25,8 +25,8 @@ use rustls::{ClientSession, Session};
 
 use log::{debug, error};
 
-use std::io;
 use crate::token::SessionTokenGroup;
+use std::io;
 
 pub struct ClientConnection {
     id: u32,
@@ -40,7 +40,7 @@ pub struct ClientConnection {
     tx: Option<Sender<Vec<u8>>>,
     rx: Option<Receiver<Vec<u8>>>,
 
-    session_token_group: SessionTokenGroup
+    session_token_group: SessionTokenGroup,
 }
 
 impl ClientConnection {
@@ -50,7 +50,7 @@ impl ClientConnection {
         hostname: &str,
         tx: Option<Sender<Vec<u8>>>,
         rx: Option<Receiver<Vec<u8>>>,
-        session_token_group: SessionTokenGroup
+        session_token_group: SessionTokenGroup,
     ) -> ClientConnection {
         let mut config = rustls::ClientConfig::new();
         config
@@ -80,7 +80,14 @@ impl ClientConnection {
     pub fn new_by_hostname(id: u32, ip: &str, port: u16, hostname: &str) -> ClientConnection {
         let socketaddr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
         // TODO: remove
-        Self::new(id, &socketaddr, hostname, None, None, SessionTokenGroup::new_from_counter(&mut 1))
+        Self::new(
+            id,
+            &socketaddr,
+            hostname,
+            None,
+            None,
+            SessionTokenGroup::new_from_counter(&mut 1),
+        )
     }
 
     fn do_read(&mut self) {
@@ -139,8 +146,8 @@ impl ClientConnection {
 
             println!("Server -> Proxy");
             match String::from_utf8(buffer.to_vec()) {
-                Ok(s) =>  println!("Plaintext: {}", s),
-                Err(_) => println!("Plaintext: {:?}", buffer.to_vec())
+                Ok(s) => println!("Plaintext: {}", s),
+                Err(_) => println!("Plaintext: {:?}", buffer.to_vec()),
             }
 
             if let Some(tx) = self.tx.as_mut() {
@@ -180,7 +187,7 @@ impl ClientConnection {
                 mio::Ready::readable(),
                 mio::PollOpt::level() | mio::PollOpt::oneshot(),
             )
-                .unwrap();
+            .unwrap();
         }
     }
 
@@ -239,7 +246,6 @@ impl ClientConnection {
                 self.fetch_new_data();
             }
         }
-
 
         if !self.closed {
             self.reregister(poll);

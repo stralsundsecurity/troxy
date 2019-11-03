@@ -6,7 +6,7 @@ pub struct SessionTokenGroup {
     pub client_connection: Token,
 
     pub server_rx: Token,
-    pub client_rx: Token
+    pub client_rx: Token,
 }
 
 impl SessionTokenGroup {
@@ -28,7 +28,7 @@ impl SessionTokenGroup {
             client_connection,
 
             server_rx,
-            client_rx
+            client_rx,
         }
     }
 }

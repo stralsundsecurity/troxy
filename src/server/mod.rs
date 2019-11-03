@@ -29,8 +29,8 @@ use crate::token::SessionTokenGroup;
 use crate::client::ClientConnection;
 use crate::connection::ProxySession;
 use log::{debug, error, info, warn};
-use std::hash::Hash;
 use mio_extras::channel::{channel, Receiver, Sender};
+use std::hash::Hash;
 
 #[derive(Debug, Clone)]
 pub enum ServerMode {
@@ -87,8 +87,8 @@ impl TlsServer {
                 let tls_session = rustls::ServerSession::new(&self.tls_config);
 
                 // Prepare tokens
-                let session_token_group = SessionTokenGroup::new_from_counter(
-                    &mut self.next_token_id);
+                let session_token_group =
+                    SessionTokenGroup::new_from_counter(&mut self.next_token_id);
 
                 // Create MPSC channels
                 // Server sends to the Client
@@ -106,7 +106,7 @@ impl TlsServer {
                         server_tx,
                         server_rx,
                         Some(client_tx),
-                        Some(client_rx)
+                        Some(client_rx),
                     );
                 server_connection.register(poll);
 
@@ -117,7 +117,7 @@ impl TlsServer {
                 );
                 self.rx_connections.insert(
                     session_token_group.server_rx.clone(),
-                    session_token_group.server_connection.clone()
+                    session_token_group.server_connection.clone(),
                 );
 
                 // Client token
@@ -130,7 +130,7 @@ impl TlsServer {
 
                     self.rx_connections.insert(
                         session_token_group.client_rx.clone(),
-                        session_token_group.client_connection.clone()
+                        session_token_group.client_connection.clone(),
                     );
                 }
 
@@ -244,13 +244,8 @@ impl ServerConnection {
         client_tx: Option<Sender<Vec<u8>>>,
         client_rx: Option<Receiver<Vec<u8>>>,
     ) -> (ServerConnection, Option<ClientConnection>) {
-        let forwarded = Self::open_forwarded(
-            id,
-            &mode,
-            client_tx,
-            client_rx,
-            session_token_group.clone()
-        );
+        let forwarded =
+            Self::open_forwarded(id, &mode, client_tx, client_rx, session_token_group.clone());
 
         (
             ServerConnection {
@@ -274,7 +269,7 @@ impl ServerConnection {
         mode: &ServerMode,
         tx: Option<Sender<Vec<u8>>>,
         rx: Option<Receiver<Vec<u8>>>,
-        session_token_group: SessionTokenGroup
+        session_token_group: SessionTokenGroup,
     ) -> Option<ClientConnection> {
         match *mode {
             ServerMode::Plain(ref endpoint) => {
@@ -385,8 +380,8 @@ impl ServerConnection {
     fn incoming_plaintext(&mut self, buffer: &[u8]) {
         println!("Client -> Server");
         match String::from_utf8(buffer.to_vec()) {
-            Ok(s) =>  println!("Plaintext: {}", s),
-            Err(_) => println!("Plaintext: {:?}", buffer.to_vec())
+            Ok(s) => println!("Plaintext: {}", s),
+            Err(_) => println!("Plaintext: {:?}", buffer.to_vec()),
         }
 
         match self.mode {
@@ -482,7 +477,7 @@ impl ServerConnection {
             mio::Ready::readable(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
-            .unwrap();
+        .unwrap();
     }
 
     fn reregister(&self, poll: &mut mio::Poll) {
@@ -494,8 +489,6 @@ impl ServerConnection {
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
         .unwrap();
-
-
     }
 
     fn event_set(&self) -> mio::Ready {

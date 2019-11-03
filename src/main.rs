@@ -5,7 +5,7 @@
 //!
 //! ## Features
 //!
-//! The goal is to support the following 
+//! The goal is to support the following
 //! features:
 //!
 //! * protocol independent TLS proxy
@@ -17,7 +17,7 @@
 //! ## Technology
 //!
 //! The TLS proxy is built on [rustls][1].
-//! Some modules (including this) 
+//! Some modules (including this)
 //! are based on the rustls-mio examples.
 //! See [rustls/rustls-mio][2].
 //! The example code was authored by Joseph Birr-Pixton
@@ -31,15 +31,15 @@ use std::net::SocketAddr;
 use mio::net::TcpListener;
 use mio::Poll;
 
-use clap::{Arg, App, SubCommand};
-use crate::server::ServerMode::{Plain, Http};
 use crate::server::Endpoint;
+use crate::server::ServerMode::{Http, Plain};
+use clap::{App, Arg, SubCommand};
 
 use log::debug;
 
 pub mod client;
-pub mod server;
 pub mod connection;
+pub mod server;
 pub mod token;
 
 const LISTENER: mio::Token = mio::Token(0);
@@ -51,59 +51,76 @@ fn main() {
         .version("0.1")
         .author("Viktor Garske <info@v-gar.de>")
         .about("TLS interception proxy")
-        .arg(Arg::with_name("port")
-             .short("p")
-             .long("port")
-             .value_name("PORT")
-             .default_value("8080")
-             .help("Sets the port to listen on")
-             .takes_value(true))
-        .arg(Arg::with_name("bind")
-             .short("b")
-             .long("bind")
-             .value_name("ADDRESS")
-             .default_value("0.0.0.0")
-             .help("Sets the IP address to bind on")
-             .takes_value(true))
-        .arg(Arg::with_name("certificate")
-             .short("c")
-             .long("cert")
-             .value_name("FILE")
-             .help("Sets the certifcate file")
-             .takes_value(true)
-             .required(true))
-        .arg(Arg::with_name("privkey")
-             .short("k")
-             .long("key")
-             .value_name("FILE")
-             .help("Sets the private key file")
-             .takes_value(true)
-             .required(true))
-        .subcommand(SubCommand::with_name("http")
-            .about("http proxy")
-            .version("0.1"))
-        .subcommand(SubCommand::with_name("plain")
-            .about("plain connection")
-            .arg(Arg::with_name("dsthost")
-                .long("dsthost")
-                .value_name("HOST")
-                .takes_value(true)
-                .required(true)
-                .help("IP of the destination host."))
-            .arg(Arg::with_name("dsthostname")
-                .long("dsthostname")
-                .value_name("HOSTNAME")
-                .takes_value(true)
-                .required(true)
-                .help("Name of the destination host. Must match the certificate name."))
-            .arg(Arg::with_name("dstport")
-                .long("dstport")
+        .arg(
+            Arg::with_name("port")
+                .short("p")
+                .long("port")
                 .value_name("PORT")
+                .default_value("8080")
+                .help("Sets the port to listen on")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("bind")
+                .short("b")
+                .long("bind")
+                .value_name("ADDRESS")
+                .default_value("0.0.0.0")
+                .help("Sets the IP address to bind on")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("certificate")
+                .short("c")
+                .long("cert")
+                .value_name("FILE")
+                .help("Sets the certifcate file")
                 .takes_value(true)
-                .required(true)
-                .help("Destination port")))
+                .required(true),
+        )
+        .arg(
+            Arg::with_name("privkey")
+                .short("k")
+                .long("key")
+                .value_name("FILE")
+                .help("Sets the private key file")
+                .takes_value(true)
+                .required(true),
+        )
+        .subcommand(
+            SubCommand::with_name("http")
+                .about("http proxy")
+                .version("0.1"),
+        )
+        .subcommand(
+            SubCommand::with_name("plain")
+                .about("plain connection")
+                .arg(
+                    Arg::with_name("dsthost")
+                        .long("dsthost")
+                        .value_name("HOST")
+                        .takes_value(true)
+                        .required(true)
+                        .help("IP of the destination host."),
+                )
+                .arg(
+                    Arg::with_name("dsthostname")
+                        .long("dsthostname")
+                        .value_name("HOSTNAME")
+                        .takes_value(true)
+                        .required(true)
+                        .help("Name of the destination host. Must match the certificate name."),
+                )
+                .arg(
+                    Arg::with_name("dstport")
+                        .long("dstport")
+                        .value_name("PORT")
+                        .takes_value(true)
+                        .required(true)
+                        .help("Destination port"),
+                ),
+        )
         .get_matches();
-
 
     let bind = matches.value_of("bind").unwrap();
     let port = matches.value_of("port").unwrap();
@@ -133,7 +150,10 @@ fn main() {
         let port = sub_matches.value_of("dstport").unwrap();
         let hostname = sub_matches.value_of("dsthostname").unwrap();
         let dst: SocketAddr = format!("{}:{}", host, port).parse().unwrap();
-        mode = Plain(Endpoint{ socketaddr: dst, hostname: String::from(hostname) });
+        mode = Plain(Endpoint {
+            socketaddr: dst,
+            hostname: String::from(hostname),
+        });
     } else {
         mode = Http;
     }
