@@ -22,19 +22,20 @@ use std::net::{Shutdown, SocketAddr};
 
 use rustls::{NoClientAuth, Session};
 
-use crate::connection;
 use crate::client;
+use crate::connection;
+use crate::token::SessionTokenGroup;
 
-use log::{debug, error, info, warn};
 use crate::client::ClientConnection;
 use crate::connection::ProxySession;
+use log::{debug, error, info, warn};
 use std::hash::Hash;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use mio_extras::channel::{channel, Receiver, Sender};
 
 #[derive(Debug, Clone)]
 pub enum ServerMode {
     Plain(Endpoint),
-    Http
+    Http,
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +46,7 @@ pub struct Endpoint {
 
 enum ProxyConnection {
     ServerConnection(ServerConnection),
-    ClientConnection(ClientConnection)
+    ClientConnection(ClientConnection),
 }
 
 /// Main TLS server struct
@@ -55,19 +56,23 @@ pub struct TlsServer {
     mode: ServerMode,
     server: TcpListener,
     connections: HashMap<mio::Token, ProxyConnection>,
+    rx_connections: HashMap<mio::Token, mio::Token>,
     next_id: u32,
     next_token_id: usize,
     tls_config: Arc<rustls::ServerConfig>,
 }
 
 impl TlsServer {
-    pub fn new(mode: ServerMode,
-               server: TcpListener,
-               config: Arc<rustls::ServerConfig>) -> TlsServer {
+    pub fn new(
+        mode: ServerMode,
+        server: TcpListener,
+        config: Arc<rustls::ServerConfig>,
+    ) -> TlsServer {
         TlsServer {
             mode,
             server,
             connections: HashMap::new(),
+            rx_connections: HashMap::new(),
             next_id: 0,
             next_token_id: 2,
             tls_config: config,
@@ -82,11 +87,8 @@ impl TlsServer {
                 let tls_session = rustls::ServerSession::new(&self.tls_config);
 
                 // Prepare tokens
-                let server_token = mio::Token(self.next_token_id);
-                self.next_token_id += 1;
-
-                let client_token = mio::Token(self.next_token_id);
-                self.next_token_id += 1;
+                let session_token_group = SessionTokenGroup::new_from_counter(
+                    &mut self.next_token_id);
 
                 // Create MPSC channels
                 // Server sends to the Client
@@ -95,27 +97,41 @@ impl TlsServer {
                 let (client_tx, server_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
 
                 let (server_connection, client_connection) =
-                    ServerConnection::new_with_client_connection(self.next_id,
-                                                                 socket,
-                                                                 server_token,
-                                                                 tls_session,
-                                                                 self.mode.clone(),
-                                                                 server_tx,
-                                                                 server_rx,
-                                                                 Some(client_tx),
-                                                                 Some(client_rx),
-                                                                 Some(client_token));
-                server_connection.register(poll, server_token);
+                    ServerConnection::new_with_client_connection(
+                        self.next_id,
+                        socket,
+                        session_token_group.clone(),
+                        tls_session,
+                        self.mode.clone(),
+                        server_tx,
+                        server_rx,
+                        Some(client_tx),
+                        Some(client_rx)
+                    );
+                server_connection.register(poll);
 
                 // Server token
-                self.connections
-                    .insert(server_token, ProxyConnection::ServerConnection(server_connection));
-
+                self.connections.insert(
+                    session_token_group.server_connection.clone(),
+                    ProxyConnection::ServerConnection(server_connection),
+                );
+                self.rx_connections.insert(
+                    session_token_group.server_rx.clone(),
+                    session_token_group.server_connection.clone()
+                );
 
                 // Client token
                 if let Some(client_connection) = client_connection {
-                    client_connection.register(poll, client_token);
-                    self.connections.insert(client_token, ProxyConnection::ClientConnection(client_connection));
+                    client_connection.register(poll);
+                    self.connections.insert(
+                        session_token_group.client_connection.clone(),
+                        ProxyConnection::ClientConnection(client_connection),
+                    );
+
+                    self.rx_connections.insert(
+                        session_token_group.client_rx.clone(),
+                        session_token_group.client_connection.clone()
+                    );
                 }
 
                 self.next_id += 1;
@@ -130,7 +146,11 @@ impl TlsServer {
     }
 
     pub fn conn_event(&mut self, poll: &mut mio::Poll, event: &mio::Event) {
-        let token = event.token();
+        let mut token = event.token();
+
+        if self.rx_connections.contains_key(&token) {
+            token = self.rx_connections[&token];
+        }
 
         if self.connections.contains_key(&token) {
             let proxy_connection = self.connections.get_mut(&token).unwrap();
@@ -144,13 +164,15 @@ impl TlsServer {
                 ProxyConnection::ClientConnection(client) => {
                     client.ready(poll, event);
                 }
-                _ => { unimplemented!() }
+                _ => unimplemented!(),
             }
 
             // remove old connections
             if closed {
                 self.connections.remove(&token);
             }
+        } else {
+            debug!("Missing key!");
         }
     }
 }
@@ -171,7 +193,9 @@ fn try_read(r: std::io::Result<usize>) -> std::io::Result<Option<usize>> {
 struct ServerConnection {
     id: u32,
     socket: TcpStream,
-    token: mio::Token,
+
+    session_token_group: SessionTokenGroup,
+
     closing: bool,
     closed: bool,
     mode: ServerMode,
@@ -183,80 +207,113 @@ struct ServerConnection {
 }
 
 impl ServerConnection {
-    fn new(id: u32,
-           socket: TcpStream,
-           token: mio::Token,
-           tls_session: rustls::ServerSession,
-           mode: ServerMode,
-           server_tx: Sender<Vec<u8>>,
-           server_rx: Receiver<Vec<u8>>,
-           client_tx: Sender<Vec<u8>>,
-           client_rx: Receiver<Vec<u8>>) -> ServerConnection {
+    fn new(
+        id: u32,
+        socket: TcpStream,
+        session_token_group: SessionTokenGroup,
+        tls_session: rustls::ServerSession,
+        mode: ServerMode,
+        server_tx: Sender<Vec<u8>>,
+        server_rx: Receiver<Vec<u8>>,
+        client_tx: Sender<Vec<u8>>,
+        client_rx: Receiver<Vec<u8>>,
+    ) -> ServerConnection {
         let (server_connection, _): (ServerConnection, _) = Self::new_with_client_connection(
             id,
             socket,
-            token,
+            session_token_group,
             tls_session,
             mode,
             server_tx,
             server_rx,
             None,
             None,
-            None
         );
 
         server_connection
     }
 
-    fn new_with_client_connection(id: u32,
-                                  socket: TcpStream,
-                                  token: mio::Token,
-                                  tls_session: rustls::ServerSession,
-                                  mode: ServerMode,
-                                  server_tx: Sender<Vec<u8>>,
-                                  server_rx: Receiver<Vec<u8>>,
-                                  client_tx: Option<Sender<Vec<u8>>>,
-                                  client_rx: Option<Receiver<Vec<u8>>>,
-                                  client_token: Option<mio::Token>) -> (ServerConnection, Option<ClientConnection>) {
-        let forwarded = Self::open_forwarded(id, &mode, client_tx, client_rx, client_token);
-
-        (ServerConnection {
+    fn new_with_client_connection(
+        id: u32,
+        socket: TcpStream,
+        session_token_group: SessionTokenGroup,
+        tls_session: rustls::ServerSession,
+        mode: ServerMode,
+        server_tx: Sender<Vec<u8>>,
+        server_rx: Receiver<Vec<u8>>,
+        client_tx: Option<Sender<Vec<u8>>>,
+        client_rx: Option<Receiver<Vec<u8>>>,
+    ) -> (ServerConnection, Option<ClientConnection>) {
+        let forwarded = Self::open_forwarded(
             id,
-            socket,
-            token,
-            closing: false,
-            closed: false,
-            mode,
-            tls_session,
-            sent_http_response: false,
-            tx: server_tx,
-            rx: server_rx
-        }, forwarded)
+            &mode,
+            client_tx,
+            client_rx,
+            session_token_group.clone()
+        );
+
+        (
+            ServerConnection {
+                id,
+                socket,
+                session_token_group,
+                closing: false,
+                closed: false,
+                mode,
+                tls_session,
+                sent_http_response: false,
+                tx: server_tx,
+                rx: server_rx,
+            },
+            forwarded,
+        )
     }
 
-    fn open_forwarded(id: u32, mode: &ServerMode, tx: Option<Sender<Vec<u8>>>, rx: Option<Receiver<Vec<u8>>>, token: Option<mio::Token>) -> Option<ClientConnection> {
+    fn open_forwarded(
+        id: u32,
+        mode: &ServerMode,
+        tx: Option<Sender<Vec<u8>>>,
+        rx: Option<Receiver<Vec<u8>>>,
+        session_token_group: SessionTokenGroup
+    ) -> Option<ClientConnection> {
         match *mode {
             ServerMode::Plain(ref endpoint) => {
-                debug!("Setting up forwarded client connection to {:#}", endpoint.socketaddr);
+                debug!(
+                    "Setting up forwarded client connection to {:#}",
+                    endpoint.socketaddr
+                );
                 let connection = ClientConnection::new(
-                    id, &endpoint.socketaddr, &endpoint.hostname, tx, rx, token);
+                    id,
+                    &endpoint.socketaddr,
+                    &endpoint.hostname,
+                    tx,
+                    rx,
+                    session_token_group,
+                );
                 debug!("Connection set up!");
                 Some(connection)
-            },
-            _ => None
+            }
+            _ => None,
         }
     }
 
     fn ready(&mut self, poll: &mut mio::Poll, ev: &mio::Event) {
         debug!("Ready called with poll {:?} and event {:?}", poll, ev);
-        if ev.readiness().is_readable() {
-            self.do_tls_read();
-            self.try_plain_read();
-        }
 
-        if ev.readiness().is_writable() {
-            self.fetch_new_data();
-            self.do_tls_write_and_handle_error();
+        if ev.token() == self.session_token_group.server_connection {
+            if ev.readiness().is_readable() {
+                self.do_tls_read();
+                self.try_plain_read();
+            }
+
+            if ev.readiness().is_writable() {
+                // self.fetch_new_data();
+                self.do_tls_write_and_handle_error();
+            }
+        } else if ev.token() == self.session_token_group.server_rx {
+            if ev.readiness().is_readable() {
+                self.fetch_new_data();
+            }
         }
 
         if self.closing {
@@ -326,7 +383,11 @@ impl ServerConnection {
     }
 
     fn incoming_plaintext(&mut self, buffer: &[u8]) {
-        debug!("Incoming plain: {}", String::from_utf8(buffer.to_vec()).unwrap());
+        println!("Client -> Server");
+        match String::from_utf8(buffer.to_vec()) {
+            Ok(s) =>  println!("Plaintext: {}", s),
+            Err(_) => println!("Plaintext: {:?}", buffer.to_vec())
+        }
 
         match self.mode {
             ServerMode::Http => {
@@ -364,7 +425,11 @@ impl ServerConnection {
         // let res = client::http_request("blog.v-gar.de", &request);
 
         let mut connection = client::ClientConnection::new_by_hostname(
-            self.id, "78.46.14.114", 443, "blog.v-gar.de");
+            self.id,
+            "78.46.14.114",
+            443,
+            "blog.v-gar.de",
+        );
         connection.write(&request.as_bytes());
         let res = None;
 
@@ -398,33 +463,44 @@ impl ServerConnection {
     }
 
     /// Register the Client to Proxy connection
-    fn register(&self, poll: &mut mio::Poll, server_token: mio::Token) {
-        debug!("Registering Client -> Proxy socket {:?} with token {:?}", self.socket, server_token);
+    fn register(&self, poll: &mut mio::Poll) {
+        debug!(
+            "Registering Client -> Proxy socket {:?} with token {:?}",
+            self.socket, self.session_token_group.server_connection
+        );
         poll.register(
             &self.socket,
-            server_token,
+            self.session_token_group.server_connection,
             self.event_set(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
         .unwrap();
+
+        poll.register(
+            &self.rx,
+            self.session_token_group.server_rx,
+            mio::Ready::readable(),
+            mio::PollOpt::level() | mio::PollOpt::oneshot(),
+        )
+            .unwrap();
     }
 
     fn reregister(&self, poll: &mut mio::Poll) {
         debug!("Interest: {:?}", self.event_set());
         poll.reregister(
             &self.socket,
-            self.token,
+            self.session_token_group.server_connection,
             self.event_set(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
         .unwrap();
+
+
     }
 
     fn event_set(&self) -> mio::Ready {
         let read = self.tls_session.wants_read();
         let write = self.tls_session.wants_write();
-
-        return mio::Ready::readable() | mio::Ready::writable();
 
         if read && write {
             mio::Ready::readable() | mio::Ready::writable()

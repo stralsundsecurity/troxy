@@ -10,22 +10,23 @@
 //!
 //! [1]: https://github.com/ctz/rustls/tree/master/rustls-mio
 
+use mio_extras::channel::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::sync::mpsc::{channel, Sender, Receiver};
 
-use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, Shutdown};
 use mio::net::TcpStream;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Shutdown, SocketAddr};
 
 use rustls;
 use webpki;
 use webpki_roots;
 
-use rustls::{Session, ClientSession};
+use rustls::{ClientSession, Session};
 
 use log::{debug, error};
 
 use std::io;
+use crate::token::SessionTokenGroup;
 
 pub struct ClientConnection {
     id: u32,
@@ -39,14 +40,18 @@ pub struct ClientConnection {
     tx: Option<Sender<Vec<u8>>>,
     rx: Option<Receiver<Vec<u8>>>,
 
-    token: Option<mio::Token>,
+    session_token_group: SessionTokenGroup
 }
 
 impl ClientConnection {
-    pub fn new(id: u32, socketaddr: &SocketAddr, hostname: &str,
-               tx: Option<Sender<Vec<u8>>>,
-               rx: Option<Receiver<Vec<u8>>>,
-               token: Option<mio::Token>) -> ClientConnection {
+    pub fn new(
+        id: u32,
+        socketaddr: &SocketAddr,
+        hostname: &str,
+        tx: Option<Sender<Vec<u8>>>,
+        rx: Option<Receiver<Vec<u8>>>,
+        session_token_group: SessionTokenGroup
+    ) -> ClientConnection {
         let mut config = rustls::ClientConfig::new();
         config
             .root_store
@@ -57,7 +62,7 @@ impl ClientConnection {
         let mut sock = TcpStream::connect(socketaddr).unwrap();
 
         debug!("Client session: {:?}", sess);
-        debug!("Client token: {:?}", token);
+        debug!("Client token: {:?}", session_token_group);
 
         ClientConnection {
             id,
@@ -68,13 +73,14 @@ impl ClientConnection {
             closed: false,
             tx,
             rx,
-            token
+            session_token_group,
         }
     }
 
     pub fn new_by_hostname(id: u32, ip: &str, port: u16, hostname: &str) -> ClientConnection {
         let socketaddr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
-        Self::new(id, &socketaddr, hostname, None, None, None)
+        // TODO: remove
+        Self::new(id, &socketaddr, hostname, None, None, SessionTokenGroup::new_from_counter(&mut 1))
     }
 
     fn do_read(&mut self) {
@@ -130,6 +136,13 @@ impl ClientConnection {
 
         if !buffer.is_empty() {
             debug!("Plaintext read: {:?}", buffer.len());
+
+            println!("Server -> Proxy");
+            match String::from_utf8(buffer.to_vec()) {
+                Ok(s) =>  println!("Plaintext: {}", s),
+                Err(_) => println!("Plaintext: {:?}", buffer.to_vec())
+            }
+
             if let Some(tx) = self.tx.as_mut() {
                 tx.send(buffer.to_vec());
             }
@@ -145,26 +158,46 @@ impl ClientConnection {
     }
 
     /// Register the Proxy to Server connection
-    pub fn register(&self, poll: &mut mio::Poll, client_token: mio::Token) {
-        debug!("Registering proxy -> server socket {:?} with token {:?} and event set {:?}", self.socket, client_token, self.event_set());
+    pub fn register(&self, poll: &mut mio::Poll) {
+        debug!(
+            "Registering proxy -> server socket {:?} with token {:?} and event set {:?}",
+            self.socket,
+            self.session_token_group.client_connection,
+            self.event_set()
+        );
         poll.register(
             &self.socket,
-            client_token,
+            self.session_token_group.client_connection,
             self.event_set(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
-            .unwrap();
+        .unwrap();
+
+        if let Some(rx) = self.rx.as_ref() {
+            poll.register(
+                rx,
+                self.session_token_group.client_rx,
+                mio::Ready::readable(),
+                mio::PollOpt::level() | mio::PollOpt::oneshot(),
+            )
+                .unwrap();
+        }
     }
 
-    pub fn reregister(&self, poll: &mut mio::Poll, client_token: mio::Token) {
-        debug!("REregistering proxy -> server socket {:?} with token {:?} and event set {:?}", self.socket, client_token, self.event_set());
+    pub fn reregister(&self, poll: &mut mio::Poll) {
+        debug!(
+            "REregistering proxy -> server socket {:?} with token {:?} and event set {:?}",
+            self.socket,
+            self.session_token_group.client_connection,
+            self.event_set()
+        );
         poll.reregister(
             &self.socket,
-            client_token,
+            self.session_token_group.client_connection,
             self.event_set(),
             mio::PollOpt::level() | mio::PollOpt::oneshot(),
         )
-            .unwrap();
+        .unwrap();
     }
 
     fn event_set(&self) -> mio::Ready {
@@ -182,27 +215,34 @@ impl ClientConnection {
 
     pub fn ready(&mut self, poll: &mut mio::Poll, ev: &mio::Event) {
         debug!("Ready called with poll {:?} and event {:?}", poll, ev);
-        if ev.readiness().is_readable() {
-            debug!("Readable client connection!");
-            // read from socket
-            // self.do_tls_read();
-            // self.try_plain_read();
-            // self.receive_to_end();
-            self.do_read();
-            self.try_plain_read();
+
+        let client_connection_token = self.session_token_group.client_connection;
+        let client_rx_token = self.session_token_group.client_rx;
+
+        debug!("ev.token(): {:?}", ev.token());
+
+        if ev.token() == self.session_token_group.client_connection {
+            if ev.readiness().is_readable() {
+                debug!("Readable client connection!");
+                self.do_read();
+                self.try_plain_read();
+            }
+
+            if ev.readiness().is_writable() {
+                // write to socket
+                debug!("Writable client connection!");
+                // self.fetch_new_data();
+                self.do_tls_write();
+            }
+        } else if ev.token() == self.session_token_group.client_rx {
+            if ev.readiness().is_readable() {
+                self.fetch_new_data();
+            }
         }
 
-        if ev.readiness().is_writable() {
-            // write to socket
-            debug!("Writable client connection!");
-            self.fetch_new_data();
-            self.do_tls_write();
-        }
 
         if !self.closed {
-            if let Some(token) = self.token {
-                self.reregister(poll, token);
-            }
+            self.reregister(poll);
         }
     }
 
@@ -216,7 +256,10 @@ impl ClientConnection {
             }
             let msg = msg.unwrap();
             debug!("MPSC data received: {:?}", msg);
-            debug!("MPSC data decoded: {}", String::from_utf8(msg.clone()).unwrap());
+            debug!(
+                "MPSC data decoded: {}",
+                String::from_utf8(msg.clone()).unwrap()
+            );
             let res = self.write_all(&msg).unwrap();
             debug!("Result: {:?}", res);
         } else {

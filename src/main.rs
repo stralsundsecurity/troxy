@@ -40,6 +40,7 @@ use log::debug;
 pub mod client;
 pub mod server;
 pub mod connection;
+pub mod token;
 
 const LISTENER: mio::Token = mio::Token(0);
 
