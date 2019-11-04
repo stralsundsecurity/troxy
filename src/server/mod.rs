@@ -17,20 +17,23 @@ use std::fs;
 use std::io::{BufReader, Read, Write};
 
 use mio::net::{TcpListener, TcpStream};
-use mio::{Poll, Token};
+use mio::Poll;
 use std::net::{Shutdown, SocketAddr};
 
 use rustls::{NoClientAuth, Session};
 
+use pretty_hex::pretty_hex;
+
 use crate::client;
-use crate::connection;
+use crate::client::ClientConnection;
 use crate::token::SessionTokenGroup;
 
-use crate::client::ClientConnection;
-use crate::connection::ProxySession;
+use crate::server::DumpDirection::{ClientToProxy, ServerToProxy};
 use log::{debug, error, info, warn};
 use mio_extras::channel::{channel, Receiver, Sender};
-use std::hash::Hash;
+use std::fs::File;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub enum ServerMode {
@@ -49,6 +52,11 @@ enum ProxyConnection {
     ClientConnection(ClientConnection),
 }
 
+enum DumpDirection {
+    ClientToProxy,
+    ServerToProxy,
+}
+
 /// Main TLS server struct
 /// Will be constructed one time for
 /// every server
@@ -60,6 +68,8 @@ pub struct TlsServer {
     next_id: u32,
     next_token_id: usize,
     tls_config: Arc<rustls::ServerConfig>,
+    output_path: Option<String>,
+    dangerous: bool,
 }
 
 impl TlsServer {
@@ -67,6 +77,8 @@ impl TlsServer {
         mode: ServerMode,
         server: TcpListener,
         config: Arc<rustls::ServerConfig>,
+        output_path: Option<String>,
+        dangerous: bool,
     ) -> TlsServer {
         TlsServer {
             mode,
@@ -76,6 +88,8 @@ impl TlsServer {
             next_id: 0,
             next_token_id: 2,
             tls_config: config,
+            output_path,
+            dangerous,
         }
     }
 
@@ -107,6 +121,8 @@ impl TlsServer {
                         server_rx,
                         Some(client_tx),
                         Some(client_rx),
+                        self.output_path.clone(),
+                        self.dangerous,
                     );
                 server_connection.register(poll);
 
@@ -155,7 +171,7 @@ impl TlsServer {
         if self.connections.contains_key(&token) {
             let proxy_connection = self.connections.get_mut(&token).unwrap();
 
-            let mut closed = false;
+            let closed;
             match proxy_connection {
                 ProxyConnection::ServerConnection(server) => {
                     server.ready(poll, event);
@@ -163,8 +179,8 @@ impl TlsServer {
                 }
                 ProxyConnection::ClientConnection(client) => {
                     client.ready(poll, event);
+                    closed = client.closed;
                 }
-                _ => unimplemented!(),
             }
 
             // remove old connections
@@ -173,19 +189,6 @@ impl TlsServer {
             }
         } else {
             debug!("Missing key!");
-        }
-    }
-}
-
-fn try_read(r: std::io::Result<usize>) -> std::io::Result<Option<usize>> {
-    match r {
-        Ok(len) => Ok(Some(len)),
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                Ok(None)
-            } else {
-                Err(e)
-            }
         }
     }
 }
@@ -204,35 +207,11 @@ struct ServerConnection {
 
     tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
+
+    output_path: Option<String>,
 }
 
 impl ServerConnection {
-    fn new(
-        id: u32,
-        socket: TcpStream,
-        session_token_group: SessionTokenGroup,
-        tls_session: rustls::ServerSession,
-        mode: ServerMode,
-        server_tx: Sender<Vec<u8>>,
-        server_rx: Receiver<Vec<u8>>,
-        client_tx: Sender<Vec<u8>>,
-        client_rx: Receiver<Vec<u8>>,
-    ) -> ServerConnection {
-        let (server_connection, _): (ServerConnection, _) = Self::new_with_client_connection(
-            id,
-            socket,
-            session_token_group,
-            tls_session,
-            mode,
-            server_tx,
-            server_rx,
-            None,
-            None,
-        );
-
-        server_connection
-    }
-
     fn new_with_client_connection(
         id: u32,
         socket: TcpStream,
@@ -243,9 +222,17 @@ impl ServerConnection {
         server_rx: Receiver<Vec<u8>>,
         client_tx: Option<Sender<Vec<u8>>>,
         client_rx: Option<Receiver<Vec<u8>>>,
+        output_path: Option<String>,
+        dangerous: bool,
     ) -> (ServerConnection, Option<ClientConnection>) {
-        let forwarded =
-            Self::open_forwarded(id, &mode, client_tx, client_rx, session_token_group.clone());
+        let forwarded = Self::open_forwarded(
+            id,
+            &mode,
+            client_tx,
+            client_rx,
+            session_token_group.clone(),
+            dangerous,
+        );
 
         (
             ServerConnection {
@@ -259,6 +246,7 @@ impl ServerConnection {
                 sent_http_response: false,
                 tx: server_tx,
                 rx: server_rx,
+                output_path,
             },
             forwarded,
         )
@@ -270,6 +258,7 @@ impl ServerConnection {
         tx: Option<Sender<Vec<u8>>>,
         rx: Option<Receiver<Vec<u8>>>,
         session_token_group: SessionTokenGroup,
+        dangerous: bool,
     ) -> Option<ClientConnection> {
         match *mode {
             ServerMode::Plain(ref endpoint) => {
@@ -284,6 +273,7 @@ impl ServerConnection {
                     tx,
                     rx,
                     session_token_group,
+                    dangerous,
                 );
                 debug!("Connection set up!");
                 Some(connection)
@@ -379,10 +369,9 @@ impl ServerConnection {
 
     fn incoming_plaintext(&mut self, buffer: &[u8]) {
         println!("Client -> Server");
-        match String::from_utf8(buffer.to_vec()) {
-            Ok(s) => println!("Plaintext: {}", s),
-            Err(_) => println!("Plaintext: {:?}", buffer.to_vec()),
-        }
+        println!("{}\n", pretty_hex(&buffer));
+
+        self.write_to_output(ClientToProxy, buffer);
 
         match self.mode {
             ServerMode::Http => {
@@ -390,7 +379,11 @@ impl ServerConnection {
             }
             ServerMode::Plain(_) => {
                 debug!("Sending {:?} to forwarded connetion...", buffer);
-                self.tx.send(buffer.to_vec());
+                let tx_result = self.tx.send(buffer.to_vec());
+                match tx_result {
+                    Err(e) => error!("MPSC channel error {}", e),
+                    _ => {}
+                }
             }
         }
     }
@@ -404,6 +397,7 @@ impl ServerConnection {
         }
         let msg = msg.unwrap();
         debug!("MPSC data received: {:?}", msg);
+        self.write_to_output(ServerToProxy, &msg);
         let res = self.tls_session.write_all(&msg).unwrap();
         debug!("Result: {:?}", res);
     }
@@ -425,7 +419,8 @@ impl ServerConnection {
             443,
             "blog.v-gar.de",
         );
-        connection.write(&request.as_bytes());
+        connection.write(&request.as_bytes()).unwrap();
+
         let res = None;
 
         if res.is_none() {
@@ -504,8 +499,32 @@ impl ServerConnection {
         }
     }
 
-    fn is_closed(&self) -> bool {
-        self.closed
+    fn write_to_output(&mut self, dir: DumpDirection, buf: &[u8]) {
+        if let Some(path) = self.output_path.as_ref() {
+            let path = Path::new(path);
+            if path.exists() && path.is_dir() {
+                // Filename = timestamp
+                let start = SystemTime::now();
+                let since_the_epoch = start
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards");
+
+                let direction_name = match dir {
+                    DumpDirection::ClientToProxy => "c2p",
+                    DumpDirection::ServerToProxy => "s2p",
+                };
+
+                let filename = format!("{}_{}.bin", since_the_epoch.as_millis(), direction_name);
+                let filepath = format!("{}/{}", path.to_str().unwrap(), filename);
+                let mut file = File::create(&filepath).unwrap();
+
+                let write_result = file.write_all(buf);
+                match write_result {
+                    Err(e) => error!("Error writing to output file {}: {}", filepath, e),
+                    _ => {}
+                }
+            }
+        }
     }
 }
 

@@ -35,7 +35,7 @@ use crate::server::Endpoint;
 use crate::server::ServerMode::{Http, Plain};
 use clap::{App, Arg, SubCommand};
 
-use log::debug;
+use log::{debug, warn};
 
 pub mod client;
 pub mod connection;
@@ -87,6 +87,21 @@ fn main() {
                 .takes_value(true)
                 .required(true),
         )
+        .arg(
+            Arg::with_name("outputpath")
+                .short("w")
+                .long("output")
+                .value_name("DIR")
+                .help("Sets the output directory")
+                .takes_value(true)
+                .required(false),
+        )
+        .arg(
+            Arg::with_name("dangerous")
+                .long("dangerous")
+                .help("Disables certificate verification on client side")
+                .takes_value(false),
+        )
         .subcommand(
             SubCommand::with_name("http")
                 .about("http proxy")
@@ -127,6 +142,19 @@ fn main() {
     let cert_file = matches.value_of("certificate").unwrap();
     let privkey_file = matches.value_of("privkey").unwrap();
 
+    let output_path;
+    if let Some(output_path_str) = matches.value_of("outputpath") {
+        output_path = Some(String::from(output_path_str));
+    } else {
+        output_path = None;
+    }
+
+    let dangerous = matches.is_present("dangerous");
+
+    if dangerous {
+        warn!("Certificate verification on client side disabled!");
+    }
+
     let addr: SocketAddr = format!("{}:{}", bind, port).parse().unwrap();
 
     let listener = TcpListener::bind(&addr).expect("cannot bind on port");
@@ -160,7 +188,7 @@ fn main() {
 
     debug!("Mode: {:?}", mode);
 
-    let mut tlsserver = server::TlsServer::new(mode, listener, config);
+    let mut tlsserver = server::TlsServer::new(mode, listener, config, output_path, dangerous);
 
     let mut events = mio::Events::with_capacity(256);
 
