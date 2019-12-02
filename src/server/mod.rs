@@ -70,6 +70,7 @@ pub struct TlsServer {
     tls_config: Arc<rustls::ServerConfig>,
     output_path: Option<String>,
     dangerous: bool,
+    quiet: bool,
 }
 
 impl TlsServer {
@@ -79,6 +80,7 @@ impl TlsServer {
         config: Arc<rustls::ServerConfig>,
         output_path: Option<String>,
         dangerous: bool,
+        quiet: bool,
     ) -> TlsServer {
         TlsServer {
             mode,
@@ -90,6 +92,7 @@ impl TlsServer {
             tls_config: config,
             output_path,
             dangerous,
+            quiet,
         }
     }
 
@@ -123,6 +126,7 @@ impl TlsServer {
                         Some(client_rx),
                         self.output_path.clone(),
                         self.dangerous,
+                        self.quiet,
                     );
                 server_connection.register(poll);
 
@@ -209,6 +213,8 @@ struct ServerConnection {
     rx: Receiver<Vec<u8>>,
 
     output_path: Option<String>,
+
+    quiet: bool,
 }
 
 impl ServerConnection {
@@ -224,6 +230,7 @@ impl ServerConnection {
         client_rx: Option<Receiver<Vec<u8>>>,
         output_path: Option<String>,
         dangerous: bool,
+        quiet: bool,
     ) -> (ServerConnection, Option<ClientConnection>) {
         let forwarded = Self::open_forwarded(
             id,
@@ -232,6 +239,7 @@ impl ServerConnection {
             client_rx,
             session_token_group.clone(),
             dangerous,
+            quiet,
         );
 
         (
@@ -247,6 +255,7 @@ impl ServerConnection {
                 tx: server_tx,
                 rx: server_rx,
                 output_path,
+                quiet,
             },
             forwarded,
         )
@@ -259,6 +268,7 @@ impl ServerConnection {
         rx: Option<Receiver<Vec<u8>>>,
         session_token_group: SessionTokenGroup,
         dangerous: bool,
+        quiet: bool,
     ) -> Option<ClientConnection> {
         match *mode {
             ServerMode::Plain(ref endpoint) => {
@@ -274,6 +284,7 @@ impl ServerConnection {
                     rx,
                     session_token_group,
                     dangerous,
+                    quiet,
                 );
                 debug!("Connection set up!");
                 Some(connection)
@@ -368,8 +379,10 @@ impl ServerConnection {
     }
 
     fn incoming_plaintext(&mut self, buffer: &[u8]) {
-        println!("Client -> Server");
-        println!("{}\n", pretty_hex(&buffer));
+        if !self.quiet {
+            println!("Client -> Server");
+            println!("{}\n", pretty_hex(&buffer));
+        }
 
         self.write_to_output(ClientToProxy, buffer);
 

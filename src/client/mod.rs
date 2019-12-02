@@ -42,6 +42,8 @@ pub struct ClientConnection {
     rx: Option<Receiver<Vec<u8>>>,
 
     session_token_group: SessionTokenGroup,
+
+    quiet: bool,
 }
 
 impl ClientConnection {
@@ -53,6 +55,7 @@ impl ClientConnection {
         rx: Option<Receiver<Vec<u8>>>,
         session_token_group: SessionTokenGroup,
         dangerous: bool,
+        quiet: bool,
     ) -> ClientConnection {
         let mut config = rustls::ClientConfig::new();
         config
@@ -79,6 +82,7 @@ impl ClientConnection {
             tx,
             rx,
             session_token_group,
+            quiet,
         }
     }
 
@@ -93,6 +97,7 @@ impl ClientConnection {
             None,
             SessionTokenGroup::new_from_counter(&mut 1),
             false,
+            false
         )
     }
 
@@ -150,8 +155,10 @@ impl ClientConnection {
         if !buffer.is_empty() {
             debug!("Plaintext read: {:?}", buffer.len());
 
-            println!("Server -> Proxy");
-            println!("{}\n", pretty_hex(&buffer));
+            if !self.quiet {
+                println!("Server -> Proxy");
+                println!("{}\n", pretty_hex(&buffer));
+            }
 
             if let Some(tx) = self.tx.as_mut() {
                 let tx_result = tx.send(buffer.to_vec());

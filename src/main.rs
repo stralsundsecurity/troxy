@@ -102,6 +102,12 @@ fn main() {
                 .help("Disables certificate verification on client side")
                 .takes_value(false),
         )
+        .arg(
+            Arg::with_name("quiet")
+                .short("q")
+                .help("Do not print hexdump output")
+                .takes_value(false)
+        )
         .subcommand(
             SubCommand::with_name("http")
                 .about("http proxy")
@@ -150,6 +156,7 @@ fn main() {
     }
 
     let dangerous = matches.is_present("dangerous");
+    let quiet = matches.is_present("quiet");
 
     if dangerous {
         warn!("Certificate verification on client side disabled!");
@@ -188,7 +195,8 @@ fn main() {
 
     debug!("Mode: {:?}", mode);
 
-    let mut tlsserver = server::TlsServer::new(mode, listener, config, output_path, dangerous);
+    let mut tlsserver = server::TlsServer::new(mode, listener, config, output_path, dangerous,
+    quiet);
 
     let mut events = mio::Events::with_capacity(256);
 
